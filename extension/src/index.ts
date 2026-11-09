@@ -1,60 +1,36 @@
 /**
- * directus-extension-pii-protect — integrates the PII anonymization engine into d9, PER ROLE × COLLECTION.
+ * directus-extension-pii-protect — hoop-style PII masking for d9, driven by the d9 ROLE.
  *
- * Which data gets anonymized is driven by two OPT-IN config fields on each role (directus_roles), so an
- * admin controls it from the d9 UI (the role detail page) — like the other permissions, and it applies to
- * ANY role, humans included (partial anonymization):
- *   pii_encrypt_all          boolean    → anonymize ALL collections for this role ("encrypt everything" toggle)
- *   pii_encrypt_collections  csv/tags   → list of collection keys to anonymize for this role (per-collection)
- * When those fields are absent, the extension does nothing (zero schema footprint by default).
+ * Model (output masking, NOT a crypto boundary — it complements RBAC, it does not replace it):
+ *   A role is "masked" via ONE opt-in boolean on directus_roles (pii_mask). For a masked role, EVERY value
+ *   that leaves the d9 API is scanned and its PII is replaced by a consistent, one-way token ([TYPE:hash]).
+ *   Because we mask the RESPONSE BYTES by value (not named fields), it covers every read path uniformly:
+ *   /items, GraphQL, aggregates, field aliases, nested relations, and file metadata — no route-by-route holes.
+ *   Binary files served via /assets are redacted (text hashed, image/PDF masked, unknown type refused).
  *
- * For a role that anonymizes a given collection:
- *   items.read           → encrypt the PII of its free-text fields
- *   items.create/update  → rehydrate the [[PII:…]] markers before writing
- *   GET /assets/:pk       → text docs anonymized, images/PDF redacted, unknown type refused (fail-closed)
- *   GET /files[/:pk]      → file name/title/description encrypted
- *   files.upload          → rehydrate a document re-uploaded by such a role (round-trip)
- * File routes are gated by "all" OR the collection `directus_files` being listed.
+ *   The DB stays in clear → authorized roles (admins/humans) read normally; only masked roles get scrubbed
+ *   output. Masking is NON-reversible: no decryption endpoint, no write-path rehydrate → no decryption oracle,
+ *   no risk of corrupting data on write. The intended use is keeping PII out of an AI agent's prompts/traces.
  *
- * Environment (no coupling to a specific environment):
- *   PII_PROTECT_ENGINE_URL  URL of the sidecar engine (default http://host.docker.internal:8077)
- *   PII_PROTECT_FIELDS      JSON {collection:[fields]} to narrow WHICH fields within a collection
- *                           (default = all `text` fields). The role config decides WHICH collections.
- *   PORT                    d9 internal port, for the self-call (default 8055)
- * No custom logs: d9's native audit already records accesses.
+ * Known, accepted limitation (agent assumed non-hostile): the DB still filters/sorts on the clear value, so a
+ * deliberately adversarial role could use filter/search as an oracle. Defending that needs RBAC or at-rest.
+ *
+ * Environment:
+ *   PII_PROTECT_ENGINE_URL    engine sidecar URL (default http://host.docker.internal:8077)
+ *   PII_PROTECT_ENGINE_TOKEN  optional shared secret sent to the engine (X-Engine-Token)
  */
-import { Readable } from 'node:stream';
-import { randomUUID } from 'node:crypto';
 
 const ENGINE = process.env.PII_PROTECT_ENGINE_URL || 'http://host.docker.internal:8077';
-const ENGINE_TOKEN = process.env.PII_PROTECT_ENGINE_TOKEN; // if set, sent as X-Engine-Token on every engine call
-const SELF = 'http://127.0.0.1:' + (process.env.PORT || '8055'); // d9 self-calls on its internal port
-// Secret, per-process. The extension sends it on its internal re-fetch to avoid recursion. It must NOT be
-// guessable by clients — otherwise anyone could add it to bypass anonymization. Never a fixed/known value.
-const BYPASS = randomUUID();
+const ENGINE_TOKEN = process.env.PII_PROTECT_ENGINE_TOKEN;
 
-// File extension → engine endpoint. Absent = unsupported type → fail-closed refusal.
+// File extension → engine redaction endpoint. Absent = unsupported type → fail-closed refusal.
 const FILE_ROUTE: Record<string, string> = {
   txt: '/anonymize-doc', md: '/anonymize-doc', csv: '/anonymize-doc', json: '/anonymize-doc', docx: '/anonymize-doc',
   png: '/redact-image', jpg: '/redact-image', jpeg: '/redact-image', gif: '/redact-image',
   bmp: '/redact-image', tiff: '/redact-image', tif: '/redact-image', webp: '/redact-image',
   pdf: '/redact-pdf',
 };
-// File metadata that carries PII (the NAME of the object, not just its content) → encrypted as a whole.
-const FILE_META = ['filename_download', 'title', 'description'];
-
-// Optional env refinement of WHICH fields within a collection (default = all `text`-type fields).
-let FIELDS_MAP: Record<string, string[]> | null = null;
-const _pf = process.env.PII_PROTECT_FIELDS;
-if (_pf && _pf !== '*') { try { FIELDS_MAP = JSON.parse(_pf); } catch { /* default: all text fields */ } }
-
 const ext = (name: string) => name.toLowerCase().split('.').pop() || '';
-
-function textFields(schema: any, collection: string): string[] {
-  if (FIELDS_MAP) return FIELDS_MAP[collection] || [];
-  const fields = schema?.collections?.[collection]?.fields || {};
-  return Object.values(fields).filter((f: any) => f?.type === 'text').map((f: any) => f.field);
-}
 
 function toList(v: any): string[] {
   if (!v) return [];
@@ -63,28 +39,7 @@ function toList(v: any): string[] {
   return String(v).split(',').map((s) => s.trim()).filter(Boolean);
 }
 
-// Per-role config, cached briefly (avoids a DB query per read item). Missing fields → no anonymization.
-type Cfg = { all: boolean; cols: Set<string>; at: number };
-const roleCache = new Map<string, Cfg>();
-async function roleConfig(database: any, roleId?: string): Promise<Cfg> {
-  if (!roleId) return { all: false, cols: new Set(), at: 0 };
-  const hit = roleCache.get(roleId);
-  if (hit && Date.now() - hit.at < 3_000) return hit;   // short TTL: config changes propagate fast
-  let all = false, cols = new Set<string>();
-  try {
-    const row = await database('directus_roles')
-      .select('pii_encrypt_all', 'pii_encrypt_collections').where({ id: roleId }).first();
-    all = !!row?.pii_encrypt_all;
-    cols = new Set(toList(row?.pii_encrypt_collections));
-  } catch { /* config fields not installed → extension stays inert */ }
-  const cfg = { all, cols, at: Date.now() };
-  roleCache.set(roleId, cfg);
-  return cfg;
-}
-const anonymizes = (cfg: Cfg, collection: string) => cfg.all || cfg.cols.has(collection);
-const anonymizesFiles = (cfg: Cfg) => cfg.all || cfg.cols.has('directus_files');
-
-// Engine calls: text (→ text) and file (→ file). Throw if the engine returns an error (→ fail-closed upstream).
+// Engine calls. Throw on error → the caller fails CLOSED (never serves clear on an engine failure).
 async function post(path: string, payload: object): Promise<any> {
   const headers: Record<string, string> = { 'content-type': 'application/json' };
   if (ENGINE_TOKEN) headers['x-engine-token'] = ENGINE_TOKEN;
@@ -92,7 +47,6 @@ async function post(path: string, payload: object): Promise<any> {
   if (!r.ok) throw new Error('engine HTTP ' + r.status);
   return r.json();
 }
-const callText = async (path: string, text: string): Promise<string> => (await post(path, { text })).text;
 const callFile = async (path: string, filename: string, buf: Buffer): Promise<Buffer> =>
   Buffer.from((await post(path, { filename, content_b64: buf.toString('base64') })).content_b64, 'base64');
 
@@ -102,150 +56,133 @@ async function bufferStream(stream: any): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
-export default ({ filter, init, action }: any, { logger, database, services, getSchema }: any) => {
-  // ---- SETUP: ensure the control fields on directus_roles (idempotent, drop-in) ----
-  // Install the extension and the config appears on the role page — no setup script. The collection
-  // checkbox choices are refreshed from the live schema on each boot.
+// Per-role "is this role masked?", cached briefly. fail-CLOSED: a transient config-read error never opens up.
+type Cfg = { masked: boolean; at: number };
+const roleCache = new Map<string, Cfg>();
+let fieldsReady = false; // set once the config field exists → distinguishes "not installed" from "read error"
+
+export default ({ init }: any, { logger, database, services, getSchema }: any) => {
+  async function roleMasked(roleId?: string): Promise<boolean> {
+    if (!fieldsReady || !roleId) return false; // config not installed yet, or public request → inert
+    const hit = roleCache.get(roleId);
+    if (hit && Date.now() - hit.at < 3_000) return hit.masked;
+    try {
+      const row = await database('directus_roles').select('*').where({ id: roleId }).first();
+      const masked = !!(row?.pii_mask || row?.pii_encrypt_all ||
+        (row?.pii_encrypt_collections && toList(row.pii_encrypt_collections).length)); // honor legacy fields too
+      roleCache.set(roleId, { masked, at: Date.now() });
+      return masked;
+    } catch (e: any) {
+      if (hit) return hit.masked;                 // keep last known decision rather than fall open
+      logger.warn('[pii-protect] role config read failed, failing closed: ' + e.message);
+      return true;                                // unknown + unreadable → mask (never leak on error)
+    }
+  }
+
+  // Scan every string value in a response payload and replace PII by its one-way token, IN PLACE.
+  // One batched engine round trip per response (not per field) → bounded latency.
+  const maskInPlace = async (root: any) => {
+    const strings = new Set<string>();
+    const walk = (v: any) => {
+      if (typeof v === 'string') { if (v.length >= 2) strings.add(v); } // no upper cap: the engine chunks long text (ner.py sliding windows)
+      else if (Array.isArray(v)) v.forEach(walk);
+      else if (v && typeof v === 'object') for (const k of Object.keys(v)) walk(v[k]);
+    };
+    walk(root);
+    if (!strings.size) return;
+    const list = [...strings];
+    const { results } = await post('/anonymize-batch', { texts: list, strategy: 'hash' }); // throws → fail-closed
+    const map = new Map<string, string>(list.map((s, i) => [s, results[i]]));
+    const rep = (v: any): any => {
+      if (typeof v === 'string') return map.get(v) ?? v;
+      if (Array.isArray(v)) { for (let i = 0; i < v.length; i++) v[i] = rep(v[i]); return v; }
+      if (v && typeof v === 'object') { for (const k of Object.keys(v)) v[k] = rep(v[k]); return v; }
+      return v;
+    };
+    rep(root);
+  };
+
+  // ---- SETUP: one opt-in boolean on the role page. No collection picker (masking is role-wide) → no
+  //      "restart d9 after creating a table" problem. Idempotent, drop-in. ----
   init('app.after', async () => {
     try {
       const schema = await getSchema();
       const fieldsSvc = new services.FieldsService({ schema, accountability: { admin: true, role: null } });
       const have = new Set((await fieldsSvc.readAll('directus_roles')).map((f: any) => f.field));
-      const choices = Object.keys(schema.collections || {})
-        .filter((c: string) => c === 'directus_files' || !c.startsWith('directus_'))
-        .sort().map((c: string) => ({ text: c, value: c }));
-      if (!have.has('pii_encrypt_all')) {
+      if (!have.has('pii_mask')) {
         await fieldsSvc.createField('directus_roles', {
-          field: 'pii_encrypt_all', type: 'boolean',
-          meta: { interface: 'boolean', special: ['cast-boolean'], width: 'full',
-            options: { label: 'Encrypt all collections for this role' },
-            note: 'Shortcut: anonymize PII everywhere. Turn OFF to pick collections below.' },
+          field: 'pii_mask', type: 'boolean',
+          meta: {
+            interface: 'boolean', special: ['cast-boolean'], width: 'full',
+            options: { label: "Mask PII in this role's API responses" },
+            note: 'When ON, every value this role reads via the API (items, GraphQL, files, assets) is scanned and PII is masked (one-way). Complements RBAC — it does not replace it.',
+          },
           schema: { default_value: false },
         });
       }
-      const colMeta = {
-        interface: 'select-multiple-checkbox', special: ['cast-json'], width: 'full',
-        options: { choices }, note: 'Collections to anonymize for this role.',
-        conditions: [{ name: 'Hidden when encrypt-all is on', rule: { pii_encrypt_all: { _eq: true } }, hidden: true }],
-      };
-      if (!have.has('pii_encrypt_collections'))
-        await fieldsSvc.createField('directus_roles', { field: 'pii_encrypt_collections', type: 'json', meta: colMeta });
-      else
-        await fieldsSvc.updateField('directus_roles', { field: 'pii_encrypt_collections', meta: colMeta }); // refresh choices
-      logger.info('[pii-protect] role config fields ready');
+      fieldsReady = true;
+      logger.info('[pii-protect] role config ready (pii_mask)');
     } catch (e: any) { logger.warn('[pii-protect] role config setup skipped: ' + e.message); }
   });
 
-  // ---- READ: encrypt the collections this role anonymizes, INCLUDING nested related items ----
-  // A relation (e.g. documents.file -> directus_files) would otherwise leak the related item's PII in clear
-  // even when the parent collection isn't protected. We walk the relation graph from the payload.
-  const encryptItemFields = async (schema: any, collection: string, item: any) => {
-    if (collection === 'directus_files') { // metadata (string) -> encrypt whole, like the /files route
-      for (const f of FILE_META) if (typeof item[f] === 'string' && item[f]) {
-        try { item[f] = await callText('/encrypt', item[f]); } catch { item[f] = '[protected]'; }
-      }
-    } else {
-      for (const f of textFields(schema, collection)) if (typeof item[f] === 'string' && item[f]) {
-        try { item[f] = await callText('/anonymize', item[f]); }
-        catch (e: any) { logger.warn('[pii-protect] anonymize: ' + e.message); item[f] = '[protected — unavailable]'; } // fail-closed
-      }
-    }
-  };
-  const anonItem = async (cfg: any, schema: any, collection: string, item: any, depth: number) => {
-    if (!item || typeof item !== 'object' || depth > 6) return; // depth cap guards against relation cycles
-    if (anonymizes(cfg, collection)) await encryptItemFields(schema, collection, item);
-    for (const rel of (schema?.relations || [])) {
-      // M2O/M2A declared on this collection: item[field] is the (possibly expanded) related object
-      if (rel.collection === collection && rel.related_collection && rel.field in item) {
-        const v = item[rel.field];
-        if (Array.isArray(v)) { for (const x of v) await anonItem(cfg, schema, rel.related_collection, x, depth + 1); }
-        else if (v && typeof v === 'object') await anonItem(cfg, schema, rel.related_collection, v, depth + 1);
-      }
-      // O2M on this collection: nested under meta.one_field, items of rel.collection (covers M2M transitively)
-      const of = rel.meta?.one_field;
-      if (rel.related_collection === collection && of && of in item) {
-        const v = item[of];
-        if (Array.isArray(v)) { for (const x of v) await anonItem(cfg, schema, rel.collection, x, depth + 1); }
-        else if (v && typeof v === 'object') await anonItem(cfg, schema, rel.collection, v, depth + 1);
-      }
-    }
-  };
-  filter('items.read', async (payload: any, meta: any, ctx: any) => {
-    if (!payload) return payload;
-    const cfg = await roleConfig(ctx?.database, ctx?.accountability?.role);
-    const items = Array.isArray(payload) ? payload : [payload];
-    for (const it of items) await anonItem(cfg, ctx?.schema, meta.collection, it, 0); // walk top + nested relations
-    return payload;
-  });
-
-  // ---- WRITE: rehydrate the markers before persistence ----
-  const rehydrate = async (payload: any, meta: any, ctx: any) => {
-    if (!payload) return payload;
-    const cfg = await roleConfig(ctx?.database, ctx?.accountability?.role);
-    if (!anonymizes(cfg, meta.collection)) return payload;
-    for (const f of textFields(ctx?.schema, meta.collection)) {
-      if (typeof payload[f] === 'string' && payload[f].includes('[[PII:')) {
-        try { payload[f] = await callText('/rehydrate', payload[f]); } catch (e: any) { logger.warn('[pii-protect] rehydrate: ' + e.message); }
-      }
-    }
-    return payload;
-  };
-  filter('items.create', rehydrate);
-  filter('items.update', rehydrate);
-
-  // ---- FILES: shared route guard (gated by the role anonymizing directus_files) ----
+  // ---- OUTPUT MASKING: one interceptor over all JSON data responses + binary asset redaction ----
   init('routes.before', ({ app }: any) => {
-    // Cross-cutting logic: internal re-fetch / non-matching role → raw (next); otherwise re-fetch the
-    // original with ITS creds then `handle`; any error (access denied, engine down) → `deny` (never clear).
-    const guard = (deny: (res: any, code: number) => any, handle: (orig: Response, req: any, res: any) => Promise<any>) =>
-      async (req: any, res: any, next: any) => {
-        if (req.headers['x-pii-bypass'] === BYPASS) return next(); // OUR internal re-fetch (secret) → raw
-        let on = false;
-        try { on = anonymizesFiles(await roleConfig(database, req.accountability?.role)); } catch { /* off */ }
-        if (!on) return next(); // role doesn't anonymize files → raw (d9 RBAC decides access)
-        try {
-          const orig = await fetch(SELF + req.originalUrl, {
-            headers: { authorization: req.headers.authorization || '', cookie: req.headers.cookie || '', 'x-pii-bypass': BYPASS },
-          });
-          if (!orig.ok) return deny(res, orig.status > 200 ? orig.status : 502); // upstream perm/error
-          await handle(orig, req, res);
-        } catch (e: any) {
-          logger.warn('[pii-protect] ' + req.path + ' (fail-closed): ' + e.message);
-          deny(res, 503);
-        }
-      };
-    const denyJson = (res: any, code: number) => res.status(code).json({ errors: [{ message: 'protected' }] });
+    const SCAN = ['/items', '/graphql', '/files']; // JSON data paths; /assets handled separately (binary)
+    const shouldScan = (p: string) => SCAN.some((s) => p === s || p.startsWith(s + '/'));
 
-    // Metadata: d9 does not emit items.read for directus_files → encrypt name/title/description here.
-    app.get(['/files', '/files/:pk'], guard(denyJson, async (orig: Response, _req: any, res: any) => {
-      const json: any = await orig.json();
-      const rows = Array.isArray(json?.data) ? json.data : [json?.data];
-      for (const row of rows) for (const f of (row ? FILE_META : [])) {
-        if (typeof row[f] === 'string' && row[f]) row[f] = await callText('/encrypt', row[f]); // WHOLE name encrypted, reversible
+    // Bulk export (?export=csv|json|xml, /utils/export) STREAMS outside res.json → it can't be scrubbed.
+    // For a masked role, refuse it (an agent has no need for a raw dump). Async /utils/export writes a FILE,
+    // which is then downloaded via /assets → already redacted there, so this only blocks the streaming dumps.
+    app.use(async (req: any, res: any, next: any) => {
+      const path = (req.originalUrl || '').split('?')[0];
+      const isExport = !!req.query?.export || path.startsWith('/utils/export');
+      if (isExport && await roleMasked(req.accountability?.role)) {
+        return res.status(403).json({ errors: [{ message: 'bulk export is disabled for this role (PII protection)' }] });
       }
-      res.setHeader('cache-control', 'no-store'); // role-dependent output: never cache/share it
-      res.json(json);
-    }));
+      next();
+    });
 
-    // Content: read directly via d9's AssetsService with the REQUESTER's own permissions — no self-call,
-    // so no bypass marker here. getAsset throws if the role may not read the file (→ fail-closed, never clear).
-    // text doc anonymized / image|PDF redacted / unknown type refused.
-    app.get('/assets/:pk', async (req: any, res: any, next: any) => {
-      let on = false;
-      try { on = anonymizesFiles(await roleConfig(database, req.accountability?.role)); } catch { /* off */ }
-      if (!on) return next(); // role doesn't anonymize files → d9 serves normally (RBAC decides access)
+    // Intercept res.json on data paths (Directus emits every item/GraphQL/file response via res.json). We decide
+    // scan at ENTRY from req.originalUrl — once inside a sub-router, req.path is relative ('/documents/1'). We do
+    // NOT wrap res.send (res.json funnels into it) → no double-wrap deadlock.
+    app.use((req: any, res: any, next: any) => {
+      if (!shouldScan((req.originalUrl || '').split('?')[0])) return next(); // non-data path → zero overhead
+      const origJson = res.json.bind(res);
+      let handled = false;
+      res.json = (body: any) => {
+        if (handled) return origJson(body);
+        handled = true;
+        (async () => {
+          if (body && typeof body === 'object' && await roleMasked(req.accountability?.role)) {
+            await maskInPlace(body);                       // mutate the payload in place, then serialize
+            res.setHeader('cache-control', 'no-store');    // role-dependent output: never cached/shared
+          }
+          origJson(body);
+        })().catch((e: any) => {
+          logger.warn('[pii-protect] masking failed (fail-closed): ' + e.message);
+          if (!res.headersSent) res.status(503);
+          origJson({ errors: [{ message: 'PII masking unavailable' }] });
+        });
+        return res;
+      };
+      next();
+    });
+
+    // Binary content: redact via d9's AssetsService with the REQUESTER's own permissions (perms enforced).
+    // Covers the plain id and the "/assets/:id/anything.txt" alternate address. text→hashed, image/PDF→masked.
+    app.get(['/assets/:pk', '/assets/:pk/:filename'], async (req: any, res: any, next: any) => {
+      if (!(await roleMasked(req.accountability?.role))) return next(); // d9 serves normally (RBAC decides access)
       try {
         const assets = new services.AssetsService({ schema: await getSchema(), accountability: req.accountability });
-        const { stream, file } = await assets.getAsset(req.params.pk, {}); // original bytes; perms enforced
+        const { stream, file } = await assets.getAsset(req.params.pk, {}); // original bytes; throws if forbidden
         const name = file?.filename_download || String(req.params.pk);
         const endpoint = FILE_ROUTE[ext(name)];
         if (!endpoint) return res.status(415).send('[protected — unsupported file type]'); // nothing unknown leaks
         const out = await callFile(endpoint, name, await bufferStream(stream));
         res.setHeader('content-type', file?.type || 'application/octet-stream');
-        res.setHeader('cache-control', 'no-store'); // role-dependent output: never cache/share it
-        // Encrypt the DOWNLOAD filename too (same marker as the metadata) — otherwise the clear name leaks on save.
-        res.setHeader('content-disposition', "attachment; filename*=UTF-8''" + encodeURIComponent(await callText('/encrypt', name)));
-        res.send(out);
+        res.setHeader('cache-control', 'no-store');
+        res.setHeader('content-disposition', 'attachment; filename="protected' + (ext(name) ? '.' + ext(name) : '') + '"');
+        res.send(out); // Buffer → passes through the wrapper untouched
       } catch (e: any) {
         logger.warn('[pii-protect] /assets (fail-closed): ' + e.message);
         res.status(503).send('[protected — unavailable]'); // never serve clear on error
@@ -253,27 +190,5 @@ export default ({ filter, init, action }: any, { logger, database, services, get
     });
   });
 
-  // ---- UPLOAD: rehydrate a document re-uploaded by a file-anonymizing role (reversible, text docs only) ----
-  action('files.upload', async (meta: any, ctx: any) => {
-    try {
-      if (!anonymizesFiles(await roleConfig(database, ctx?.accountability?.role))) return;
-      const key = meta?.key || meta?.payload?.id || meta;
-      if (typeof key !== 'string') return;
-      const schema = await getSchema();
-      const sys = { admin: true, role: null };
-      const files = new services.FilesService({ schema, accountability: sys });
-      const file = await files.readOne(key);
-      const name = file?.filename_download || file?.filename_disk || '';
-      if (FILE_ROUTE[ext(name)] !== '/anonymize-doc') return; // images/PDF = destructive redaction, no round-trip
-      const asset = await new services.AssetsService({ schema, accountability: sys }).getAsset(key, {});
-      const buf = await bufferStream(asset.stream || asset);
-      const clear = await callFile('/rehydrate-doc', name, buf);
-      if (clear.equals(buf)) return; // nothing to restore
-      await files.uploadOne(Readable.from(clear),
-        { type: file.type, filename_download: file.filename_download, storage: file.storage, title: file.title }, key);
-      logger.info('[pii-protect] document rehydrated on re-upload (' + name + ')');
-    } catch (e: any) { logger.warn('[pii-protect] files.upload: ' + e.message); }
-  });
-
-  logger.info('[pii-protect] loaded (engine ' + ENGINE + ')');
+  logger.info('[pii-protect] loaded (engine ' + ENGINE + ', hoop-style output masking)');
 };

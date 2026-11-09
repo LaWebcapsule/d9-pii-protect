@@ -1,11 +1,16 @@
 # d9 PII Protect
 
-Governed PII anonymization for AI agents in [d9](https://github.com/LaWebcapsule/d9).
+Governed PII masking for AI agents in [d9](https://github.com/LaWebcapsule/d9).
 
-For the roles you choose, PII in **free-text fields, documents and images** is **reversibly encrypted**
-(or redacted for images) on read; authorized users still see the original. Detection is French-first
-(Presidio + a FR NER model) and runs in a self-contained engine next to d9 — PII never leaves your
-environment. Structured fields stay handled by d9's usual permissions.
+For the roles you choose, PII in **every API response** (items, GraphQL, files, assets) is **masked on the
+way out** — each detected value is replaced by a consistent, one-way token like `[NOM_PERSONNE:a3f9c2…]`
+(documents/images are redacted). Authorized roles (admins, unconfigured roles) still read the original; the
+database stays in clear. Detection is French-first (Presidio + a FR NER model) and runs in a self-contained
+engine next to d9 — PII never leaves your environment.
+
+This **complements RBAC — it does not replace it**. The goal is to keep PII out of an AI agent's prompts and
+traces (protect the agent from itself), not to defend against a deliberately hostile user. See
+[Known limitations](#known-limitations).
 
 ## 🤖 Set it up with AI
 
@@ -16,13 +21,13 @@ New to this? Open a ready-made setup guide in your favorite AI — it reads this
 <details><summary>Or copy the prompt</summary>
 
 ```text
-Help me install the "d9 PII Protect" extension on my EXISTING d9 instance (a d9 / Directus 9 fork) so that PII in free-text fields, documents and images is encrypted for the roles I choose, while authorized users still see the original. The project: https://github.com/LaWebcapsule/d9-pii-protect — read its README and extension/README.md first. Then guide me step by step for MY setup (ask me how my d9 runs — Docker? how is it deployed? — before giving any command):
+Help me install the "d9 PII Protect" extension on my EXISTING d9 instance (a d9 / Directus 9 fork) so that PII in the API responses (items, GraphQL, files, assets) is masked for the roles I choose, while authorized users still see the original. The project: https://github.com/LaWebcapsule/d9-pii-protect — read its README and extension/README.md first. Then guide me step by step for MY setup (ask me how my d9 runs — Docker? how is it deployed? — before giving any command):
 1) Start the PII engine sidecar (Docker image built from the repo's engine/ folder; set PII_PROTECT_KEY) and note its URL.
 2) Add the extension to my d9 extensions/ folder (use the prebuilt extension/dist/index.js, or run npm install && npm run build).
 3) Point the extension at the engine via the PII_PROTECT_ENGINE_URL env var on d9.
-4) Restart d9 — it should log "[pii-protect] loaded" and auto-create its config fields on roles.
-5) Open a role (Settings > Roles & Permissions), enable "Encrypt all collections" or tick specific collections.
-Verify: read data as a user of that role (PII appears as [[PII:...]]) vs an admin (clear). Ask me questions whenever you need details about my environment.
+4) Restart d9 — it should log "[pii-protect] loaded" and auto-create its config field on roles.
+5) Open a role (Settings > Roles & Permissions), enable "Mask PII in this role's API responses".
+Verify: read data as a user of that role (PII appears as [TYPE:hash] tokens) vs an admin (clear). Ask me questions whenever you need details about my environment.
 ```
 
 </details>
@@ -40,30 +45,29 @@ docker compose up -d --build    # d9 on http://localhost:8055 + the PII engine
 
 ## Use it
 
-Open **Settings → Roles & Permissions → a role**. The extension adds two controls there automatically
+Open **Settings → Roles & Permissions → a role**. The extension adds one control there automatically
 (no setup script):
 
-![Role configuration](docs/role-config.png)
+- **Mask PII in this role's API responses** — turn it on.
 
-- **Encrypt all collections for this role** — anonymize PII everywhere, or
-- turn it off and **tick the specific collections** to anonymize.
-
-Users in that role then read the selected collections with PII encrypted (`[[PII:…]]` markers, reversible);
-anyone whose role isn't configured sees the clear value. It applies to **any role, humans included**, so you
-can also hide data from some human maintainers. Changing these controls requires role-edit rights, so a
-regular user can't alter what's encrypted.
+Every value that role reads via the API is then scanned and its PII replaced by a one-way token
+(`[TYPE:hash]`, e.g. `[NOM_PERSONNE:a3f9c2…]`); anyone whose role isn't configured sees the clear value. The
+token is a consistent keyed hash, so the same value always yields the same token (joins/dedup still work) but
+there is no way back to the clear. It applies to **any role, humans included**, so you can also hide data from
+some human maintainers. Changing this requires role-edit rights, so a regular user can't alter it.
 
 ## Configuration (environment variables)
 
 | Variable | Where | What | Default |
 |---|---|---|---|
-| `PII_PROTECT_KEY` | engine | **AES-256 key** (use a secret/KMS in production). | — (required) |
+| `PII_PROTECT_KEY` | engine | Secret key for the one-way HMAC tokens (use a secret/KMS in production). No default — the engine refuses to start without it. | — (required) |
 | `PII_PROTECT_ENGINE_URL` | extension | URL of the engine. | `http://engine:8077` |
-| `PII_PROTECT_FIELDS` | extension | JSON `{collection:[fields]}` to restrict which fields. Empty = all `text` fields. | *(empty)* |
-| `PII_PROTECT_ENTITIES` / `PII_PROTECT_SKIP` | engine | Allow-list / deny-list of PII types to encrypt. | *(empty = all)* |
+| `PII_PROTECT_ENGINE_TOKEN` | engine + extension | Optional shared secret; if set, the engine only accepts calls carrying it (`X-Engine-Token`). | *(empty = no auth)* |
+| `PII_PROTECT_ENTITIES` / `PII_PROTECT_SKIP` | engine | Allow-list / deny-list of PII types to mask. | *(empty = all)* |
 | `PII_NER_MODEL` | engine | Hugging Face NER model (see [`engine/MODELS.md`](engine/MODELS.md)). | Anonym-IA FR |
 | `PII_NER_THRESHOLD` | engine | NER confidence threshold. | `0.4` |
 | `PII_NER_ONNX_THREADS` | engine | ONNX Runtime threads (empty = auto; cap to perf cores on Apple Silicon). | *(auto)* |
+| `PII_HASH_LEN` | engine | Hex length of the token hash. | `12` |
 | `PII_OCR_LANG` | engine | Tesseract language for image redaction. | `fra` |
 
 ## Customize
@@ -73,6 +77,24 @@ regular user can't alter what's encrypted.
 - Choose which PII types → `PII_PROTECT_ENTITIES` / `PII_PROTECT_SKIP`.
 
 Architecture overview: [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
+## Known limitations
+
+This is **output masking that complements RBAC**, not encryption-at-rest. It reduces exposure of *detected*
+PII to a *non-hostile* role across every HTTP read path. By design it does **not** cover:
+
+- **A deliberately hostile role.** The database stores clear and still filters/sorts on the clear value, so a
+  role that *actively* probes (`filter[field][_starts_with]=…`, binary-searching a value) can reconstruct it.
+  Blocking that is the job of **RBAC** (don't grant the field) or encryption-at-rest.
+- **PII coming *in*.** Only what *leaves* the API is masked; a role can still *write* clear PII to the database.
+- **Data at rest.** A DB dump, direct SQL, an admin, or any unconfigured role sees the clear value — that's the point.
+- **Non-string fields.** Only string values are scanned. PII placed in a numeric/boolean column isn't masked
+  (use RBAC/field permissions there). Long text *is* handled — the engine chunks it.
+- **WebSocket / realtime.** Messages are pushed outside the HTTP response path, so they aren't scrubbed.
+  Realtime is **off by default**; keep it off for masked roles (or add a service-layer hook if you enable it).
+- **Detection is best-effort.** Whatever the engine doesn't detect leaks (geographic entities — city/postal/
+  street — are currently weak), and complex/non-UTF-8 documents may redact imperfectly. Improving recognizers
+  is ongoing; everything masked is already more than a bare d9.
 
 ## License
 

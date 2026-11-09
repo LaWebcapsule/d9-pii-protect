@@ -49,11 +49,12 @@ def _should_encrypt(entity_type):
         return False
     return entity_type not in SKIP_TYPES
 
-def anonymize(text):
+def anonymize(text, strategy="hash"):
     spans = [sp for sp in analyzer.detect(text) if _should_encrypt(sp[2])]
     out, entities = text, []
     for s, e, t in sorted(spans, key=lambda x: x[0], reverse=True):
-        out = out[:s] + crypto.marker(t, text[s:e]) + out[e:]
+        rep = crypto.marker(t, text[s:e]) if strategy == "marker" else crypto.hashtok(t, text[s:e])
+        out = out[:s] + rep + out[e:]
         entities.append(t)
     return out, list(reversed(entities))
 
@@ -92,31 +93,27 @@ def _file_op(body, fn):
     return {"filename": body.get("filename", ""), "content_b64": base64.b64encode(out).decode()}
 
 def _anonymize(b):
-    out, ents = anonymize(b.get("text", ""))
+    out, ents = anonymize(b.get("text", ""), b.get("strategy", "hash"))
     return {"text": out, "count": len(ents), "entities": ents}
 
-def _encrypt(b):
-    # Encrypt the WHOLE value into one marker (e.g. a filename: protect everything, not per-PII).
-    t = b.get("text", "")
-    return {"text": crypto.marker("TEXT", t) if t else t, "count": 1 if t else 0}
-
-def _rehydrate(b):
-    out, c = crypto.rehydrate(b.get("text", ""))
-    return {"text": out, "count": c}
+def _anonymize_batch(b):
+    # Mask many strings in ONE round trip (the response interceptor sends a whole payload's unique strings).
+    strat = b.get("strategy", "hash")
+    texts = b.get("texts", [])
+    return {"results": [anonymize(t, strat)[0] if isinstance(t, str) else t for t in texts]}
 
 def _detect(b):
     t = b.get("text", "")
     return {"spans": [{"start": s, "end": e, "type": ty, "text": t[s:e]} for s, e, ty in analyzer.detect(t)]}
 
+# NOTE: no /rehydrate, /encrypt, /rehydrate-doc — masking is one-way (hoop-style). No decryption oracle.
 POST_ROUTES = {
-    "/anonymize":     _anonymize,
-    "/encrypt":       _encrypt,
-    "/rehydrate":     _rehydrate,
-    "/detect":        _detect,
-    "/anonymize-doc": lambda b: _file_op(b, lambda d: process_doc(b.get("filename", ""), d, "anonymize")),
-    "/rehydrate-doc": lambda b: _file_op(b, lambda d: process_doc(b.get("filename", ""), d, "rehydrate")),
-    "/redact-image":  lambda b: _file_op(b, image_redact.redact_image),
-    "/redact-pdf":    lambda b: _file_op(b, image_redact.redact_pdf),
+    "/anonymize":       _anonymize,
+    "/anonymize-batch": _anonymize_batch,
+    "/detect":          _detect,
+    "/anonymize-doc":   lambda b: _file_op(b, lambda d: process_doc(b.get("filename", ""), d, "anonymize")),
+    "/redact-image":    lambda b: _file_op(b, image_redact.redact_image),
+    "/redact-pdf":      lambda b: _file_op(b, image_redact.redact_pdf),
 }
 
 # ---------------------------------------------------------------- HTTP
