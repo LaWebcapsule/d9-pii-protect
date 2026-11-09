@@ -92,9 +92,11 @@ PII to a *non-hostile* role across every HTTP read path. By design it does **not
   (use RBAC/field permissions there). Long text *is* handled — the engine chunks it.
 - **WebSocket / realtime.** Messages are pushed outside the HTTP response path, so they aren't scrubbed.
   Realtime is **off by default**; keep it off for masked roles (or add a service-layer hook if you enable it).
-- **Detection is best-effort.** Whatever the engine doesn't detect leaks (geographic entities — city/postal/
-  street — are currently weak), and complex/non-UTF-8 documents may redact imperfectly. Improving recognizers
-  is ongoing; everything masked is already more than a bare d9.
+- **Detection is best-effort.** Names, emails, phones, NIR/SIREN/SIRET/IBAN, dates, and addresses/postal/city
+  (via FR recognizers) are covered; but the city gazetteer only knows the largest communes, phone numbers
+  spelled out in words aren't caught, and complex/non-UTF-8 documents may redact imperfectly. Whatever the
+  engine doesn't detect leaks — improving recognizers is ongoing, and everything masked is already more than a
+  bare d9.
 
 ## License
 
