@@ -1,6 +1,6 @@
 """Image redaction — Presidio Image Redactor + our analyzer (FR by default) + Tesseract OCR.
 
-Unlike text/documents (REVERSIBLE marker-based encryption), image redaction is DESTRUCTIVE:
+Like text/documents (one-way hash tokens), image redaction is DESTRUCTIVE:
 PII regions are masked with rectangles. The stored file stays intact — the agent receives a
 redacted copy on the fly, while an authorized human downloads the original (decided by d9 RBAC).
 
