@@ -17,16 +17,6 @@ const FILE_ROUTE = {
   pdf: "/redact-pdf"
 };
 const ext = (name) => name.toLowerCase().split(".").pop() || "";
-function toList(v) {
-  if (!v) return [];
-  if (Array.isArray(v)) return v;
-  try {
-    const j = JSON.parse(v);
-    if (Array.isArray(j)) return j;
-  } catch {
-  }
-  return String(v).split(",").map((s) => s.trim()).filter(Boolean);
-}
 async function post(path, payload) {
   const headers = { "content-type": "application/json" };
   if (ENGINE_TOKEN) headers["x-engine-token"] = ENGINE_TOKEN;
@@ -48,8 +38,8 @@ var index_default = ({ init }, { logger, database, services, getSchema }) => {
     const hit = roleCache.get(roleId);
     if (hit && Date.now() - hit.at < 3e3) return hit.masked;
     try {
-      const row = await database("directus_roles").select("*").where({ id: roleId }).first();
-      const masked = !!(row?.pii_mask || row?.pii_encrypt_all || row?.pii_encrypt_collections && toList(row.pii_encrypt_collections).length);
+      const row = await database("directus_roles").select("pii_mask").where({ id: roleId }).first();
+      const masked = !!row?.pii_mask;
       roleCache.set(roleId, { masked, at: Date.now() });
       return masked;
     } catch (e) {
@@ -103,6 +93,16 @@ var index_default = ({ init }, { logger, database, services, getSchema }) => {
           },
           schema: { default_value: false }
         });
+      }
+      for (const legacy of ["pii_encrypt_all", "pii_encrypt_collections"]) {
+        if (have.has(legacy)) {
+          try {
+            await fieldsSvc.deleteField("directus_roles", legacy);
+            logger.info("[pii-protect] removed legacy field " + legacy);
+          } catch (e) {
+            logger.warn("[pii-protect] could not remove legacy field " + legacy + ": " + e.message);
+          }
+        }
       }
       fieldsReady = true;
       logger.info("[pii-protect] role config ready (pii_mask)");

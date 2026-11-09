@@ -32,13 +32,6 @@ const FILE_ROUTE: Record<string, string> = {
 };
 const ext = (name: string) => name.toLowerCase().split('.').pop() || '';
 
-function toList(v: any): string[] {
-  if (!v) return [];
-  if (Array.isArray(v)) return v;
-  try { const j = JSON.parse(v); if (Array.isArray(j)) return j; } catch { /* csv */ }
-  return String(v).split(',').map((s) => s.trim()).filter(Boolean);
-}
-
 // Engine calls. Throw on error → the caller fails CLOSED (never serves clear on an engine failure).
 async function post(path: string, payload: object): Promise<any> {
   const headers: Record<string, string> = { 'content-type': 'application/json' };
@@ -67,9 +60,8 @@ export default ({ init }: any, { logger, database, services, getSchema }: any) =
     const hit = roleCache.get(roleId);
     if (hit && Date.now() - hit.at < 3_000) return hit.masked;
     try {
-      const row = await database('directus_roles').select('*').where({ id: roleId }).first();
-      const masked = !!(row?.pii_mask || row?.pii_encrypt_all ||
-        (row?.pii_encrypt_collections && toList(row.pii_encrypt_collections).length)); // honor legacy fields too
+      const row = await database('directus_roles').select('pii_mask').where({ id: roleId }).first();
+      const masked = !!row?.pii_mask;
       roleCache.set(roleId, { masked, at: Date.now() });
       return masked;
     } catch (e: any) {
@@ -119,6 +111,13 @@ export default ({ init }: any, { logger, database, services, getSchema }: any) =
           },
           schema: { default_value: false },
         });
+      }
+      // Self-cleanup: drop the legacy fields from the previous (reversible, per-collection) model.
+      for (const legacy of ['pii_encrypt_all', 'pii_encrypt_collections']) {
+        if (have.has(legacy)) {
+          try { await fieldsSvc.deleteField('directus_roles', legacy); logger.info('[pii-protect] removed legacy field ' + legacy); }
+          catch (e: any) { logger.warn('[pii-protect] could not remove legacy field ' + legacy + ': ' + e.message); }
+        }
       }
       fieldsReady = true;
       logger.info('[pii-protect] role config ready (pii_mask)');
