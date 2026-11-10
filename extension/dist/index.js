@@ -1,5 +1,6 @@
 const ENGINE = process.env.PII_PROTECT_ENGINE_URL || "http://host.docker.internal:8077";
 const ENGINE_TOKEN = process.env.PII_PROTECT_ENGINE_TOKEN;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const FILE_ROUTE = {
   txt: "/anonymize-doc",
   md: "/anonymize-doc",
@@ -52,7 +53,7 @@ var index_default = ({ init }, { logger, database, services, getSchema }) => {
     const strings = /* @__PURE__ */ new Set();
     const walk = (v) => {
       if (typeof v === "string") {
-        if (v.length >= 2) strings.add(v);
+        if (v.length >= 2 && !UUID_RE.test(v)) strings.add(v);
       } else if (Array.isArray(v)) v.forEach(walk);
       else if (v && typeof v === "object") for (const k of Object.keys(v)) walk(v[k]);
     };

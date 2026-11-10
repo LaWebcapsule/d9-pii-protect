@@ -22,6 +22,8 @@
 
 const ENGINE = process.env.PII_PROTECT_ENGINE_URL || 'http://host.docker.internal:8077';
 const ENGINE_TOKEN = process.env.PII_PROTECT_ENGINE_TOKEN;
+// Identifiers are never PII and clients (incl. the d9 app) need them to navigate — never mask a UUID.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // File extension → engine redaction endpoint. Absent = unsupported type → fail-closed refusal.
 const FILE_ROUTE: Record<string, string> = {
@@ -76,7 +78,7 @@ export default ({ init }: any, { logger, database, services, getSchema }: any) =
   const maskInPlace = async (root: any) => {
     const strings = new Set<string>();
     const walk = (v: any) => {
-      if (typeof v === 'string') { if (v.length >= 2) strings.add(v); } // no upper cap: the engine chunks long text (ner.py sliding windows)
+      if (typeof v === 'string') { if (v.length >= 2 && !UUID_RE.test(v)) strings.add(v); } // skip UUIDs (ids); engine chunks long text
       else if (Array.isArray(v)) v.forEach(walk);
       else if (v && typeof v === 'object') for (const k of Object.keys(v)) walk(v[k]);
     };

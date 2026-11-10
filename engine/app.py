@@ -42,7 +42,11 @@ def _types_env(name):
 ONLY_TYPES = _types_env("PII_PROTECT_ENTITIES")   # empty = no restriction
 SKIP_TYPES = _types_env("PII_PROTECT_SKIP")
 
+DEFAULT_SKIP = {"UUID"}  # identifiers: never PII, and clients need them (primary / foreign keys)
+
 def _should_encrypt(entity_type):
+    if entity_type in DEFAULT_SKIP:
+        return False
     if ONLY_TYPES and entity_type not in ONLY_TYPES:
         return False
     return entity_type not in SKIP_TYPES
