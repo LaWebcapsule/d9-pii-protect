@@ -47,6 +47,8 @@ docker compose up -d --build    # d9 on http://localhost:8055 + the PII engine
 
 Open **Settings → Roles & Permissions → a role** and turn on **Mask PII in this role's API responses**.
 
+![The "Mask PII" toggle on a role page](docs/role-config.png)
+
 That's it. Everyone in that role now reads every text field (short or long) with its personal data masked;
 other roles are unaffected. Numbers and other non-text fields are left to d9's own permissions. Turning the
 switch requires role-edit rights, so a regular user can't change what's masked.
