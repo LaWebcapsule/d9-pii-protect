@@ -79,6 +79,25 @@ def _docx_transform(data, fn):
                 else: p.add_run(new)
     out = io.BytesIO(); d.save(out); return out.getvalue()
 
+PDF_MIN_TEXT = int(os.environ.get("PII_PDF_MIN_TEXT", "20"))  # text-layer chars to treat a PDF as text, not a scan
+
+def _pdf_text(data):
+    try:
+        from pypdf import PdfReader
+        return "\n".join((pg.extract_text() or "") for pg in PdfReader(io.BytesIO(data)).pages)
+    except Exception:
+        return ""
+
+def _redact_pdf(b):
+    """PDF with a text layer → extract + mask the text (fast, reliable). Real scan (no text) → OCR fallback."""
+    data = base64.b64decode(b.get("content_b64", ""))
+    name = b.get("filename", "")
+    text = _pdf_text(data)
+    if len(text.strip()) >= PDF_MIN_TEXT:
+        out = anonymize(text)[0].encode("utf-8")
+        return {"filename": name, "content_b64": base64.b64encode(out).decode(), "content_type": "text/plain; charset=utf-8"}
+    return {"filename": name, "content_b64": base64.b64encode(image_redact.redact_pdf(data)).decode()}
+
 def process_doc(filename, data):
     ext = (filename or "").lower().rsplit(".", 1)[-1]
     fn = lambda t: anonymize(t)[0]
@@ -112,7 +131,7 @@ POST_ROUTES = {
     "/detect":          _detect,
     "/anonymize-doc":   lambda b: _file_op(b, lambda d: process_doc(b.get("filename", ""), d)),
     "/redact-image":    lambda b: _file_op(b, image_redact.redact_image),
-    "/redact-pdf":      lambda b: _file_op(b, image_redact.redact_pdf),
+    "/redact-pdf":      _redact_pdf,
 }
 
 # ---------------------------------------------------------------- HTTP

@@ -52,7 +52,9 @@ _CITIES = [
     "Mérignac", "Saint-Nazaire", "Valence", "Quimper", "Troyes", "Chambéry", "Lorient", "Vannes", "Bayonne",
     "Ajaccio", "Dunkerque", "Cherbourg", "Niort", "Chartres", "Angoulême", "Lorient",
 ]
-_CITY_RE = r"\b(?:" + "|".join(c.replace(".", r"\.") for c in _CITIES) + r")\b"
+# Match Title-case ("Paris") AND all-caps ("PARIS", common on tickets/invoices), but not lowercase (FP-prone).
+_city_forms = _CITIES + [c.upper() for c in _CITIES]
+_CITY_RE = r"\b(?:" + "|".join(c.replace(".", r"\.") for c in _city_forms) + r")\b"
 # Presidio compiles patterns case-INSENSITIVE; force the gazetteer case-sensitive so it matches the proper
 # noun "Paris" but not the lowercase common word, and doesn't fire on arbitrary capitalized words.
 _CITY = r"(?-i:" + _CITY_RE + r")"

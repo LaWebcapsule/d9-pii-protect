@@ -42,9 +42,6 @@ async function post(path: string, payload: object): Promise<any> {
   if (!r.ok) throw new Error('engine HTTP ' + r.status);
   return r.json();
 }
-const callFile = async (path: string, filename: string, buf: Buffer): Promise<Buffer> =>
-  Buffer.from((await post(path, { filename, content_b64: buf.toString('base64') })).content_b64, 'base64');
-
 async function bufferStream(stream: any): Promise<Buffer> {
   const chunks: Buffer[] = [];
   for await (const c of stream) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c));
@@ -177,10 +174,13 @@ export default ({ init }: any, { logger, database, services, getSchema }: any) =
         const name = file?.filename_download || String(req.params.pk);
         const endpoint = FILE_ROUTE[ext(name)];
         if (!endpoint) return res.status(415).send('[protected — unsupported file type]'); // nothing unknown leaks
-        const out = await callFile(endpoint, name, await bufferStream(stream));
-        res.setHeader('content-type', file?.type || 'application/octet-stream');
+        const resp = await post(endpoint, { filename: name, content_b64: (await bufferStream(stream)).toString('base64') });
+        const out = Buffer.from(resp.content_b64, 'base64');
+        const ctype = resp.content_type || file?.type || 'application/octet-stream'; // engine may change it (text-layer PDF → text)
+        const outExt = ctype.indexOf('text/') === 0 ? 'txt' : (ext(name) || 'bin');
+        res.setHeader('content-type', ctype);
         res.setHeader('cache-control', 'no-store');
-        res.setHeader('content-disposition', 'attachment; filename="protected' + (ext(name) ? '.' + ext(name) : '') + '"');
+        res.setHeader('content-disposition', 'attachment; filename="protected.' + outExt + '"'); // generic name, never the original
         res.send(out); // Buffer → passes through the wrapper untouched
       } catch (e: any) {
         logger.warn('[pii-protect] /assets (fail-closed): ' + e.message);

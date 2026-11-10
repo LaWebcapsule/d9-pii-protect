@@ -10,6 +10,7 @@ sentencepiece
 protobuf
 cryptography
 pdf2image
+pypdf
 pillow
 numpy
 python-docx
