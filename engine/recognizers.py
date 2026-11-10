@@ -36,6 +36,28 @@ def _ndig(s): return sum(c.isdigit() for c in s)
 # French month names, used to match textual dates (matching data, not translatable).
 _MOIS = "janvier|février|fevrier|mars|avril|mai|juin|juillet|août|aout|septembre|octobre|novembre|décembre|decembre"
 
+# Street types (voie), used to detect an address line even when the NER only catches the house number.
+_VOIE = (r"rue|avenue|av|bd|boulevard|impasse|allée|allee|chemin|place|quai|cours|route|rte|"
+         r"passage|square|voie|faubourg|fg|résidence|residence|lotissement")
+
+# Gazetteer of the largest French communes — catches a city mentioned on its own (the NER model has a VILLE
+# label but rarely predicts it). Matching data, not translatable. Extend as needed.
+_CITIES = [
+    "Paris", "Marseille", "Lyon", "Toulouse", "Nice", "Nantes", "Montpellier", "Strasbourg", "Bordeaux",
+    "Lille", "Rennes", "Reims", "Le Havre", "Saint-Étienne", "Toulon", "Grenoble", "Dijon", "Angers",
+    "Nîmes", "Villeurbanne", "Clermont-Ferrand", "Le Mans", "Aix-en-Provence", "Brest", "Tours", "Amiens",
+    "Limoges", "Annecy", "Perpignan", "Besançon", "Metz", "Orléans", "Rouen", "Mulhouse", "Caen", "Nancy",
+    "Argenteuil", "Montreuil", "Roubaix", "Tourcoing", "Nanterre", "Avignon", "Poitiers", "Créteil",
+    "Versailles", "Pau", "Calais", "La Rochelle", "Cannes", "Antibes", "Béziers", "Colmar", "Bourges",
+    "Mérignac", "Saint-Nazaire", "Valence", "Quimper", "Troyes", "Chambéry", "Lorient", "Vannes", "Bayonne",
+    "Ajaccio", "Dunkerque", "Cherbourg", "Niort", "Chartres", "Angoulême", "Lorient",
+]
+_CITY_RE = r"\b(?:" + "|".join(c.replace(".", r"\.") for c in _CITIES) + r")\b"
+# Presidio compiles patterns case-INSENSITIVE; force the gazetteer case-sensitive so it matches the proper
+# noun "Paris" but not the lowercase common word, and doesn't fire on arbitrary capitalized words.
+_CITY = r"(?-i:" + _CITY_RE + r")"
+_POSTAL = r"(?:0[1-9]|[1-8]\d|9[0-5]|97|98)\d{3}"   # FR postal code, valid department prefixes only
+
 # --- Recognizers WITHOUT checksum: (ENTITY, regex, score, [context words]) ---
 # We reuse the TYPE VOCABULARY of the NER model (see ner.py LABELS) so there is a SINGLE list of
 # types to know about (e.g. PII_PROTECT_SKIP=DATE covers every date). Align these names on the
@@ -47,6 +69,16 @@ SIMPLE = [
     ("NUM_SECURITE_SOCIALE", r"\b[12](?:[ .]?\d){14}\b", 0.7, ["nir", "sécurité sociale", "sécu", "assuré", "sociale"]),
     ("DATE",      rf"\b\d{{1,2}}(?:er)?\s+(?:{_MOIS})(?:\s+\d{{4}})?\b", 0.6, ["né", "née", "le", "date"]),
     ("DATE",      r"\b\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4}\b", 0.5, []),
+    # --- Address / geography (the NER model barely predicts these despite having the labels) ---
+    # Postal code ONLY when immediately followed by a known city ("75002 Paris") — avoids masking every
+    # 5-digit number (order ids, amounts). Masks the whole "CP City" chunk.
+    ("VILLE", rf"\b{_POSTAL}\s+{_CITY}", 0.7, []),
+    # A street line: house number + street type + name (e.g. "12 rue de la Paix"). High score so the full
+    # span wins over the NER's house-number-only fragment.
+    ("ADRESSE", rf"(?i)\b\d{{1,4}}(?:\s?(?:bis|ter|quater))?\s+(?:{_VOIE})\b[^\n,.;:]{{0,50}}", 0.85,
+        ["adresse", "habite", "domicil", "réside", "demeurant"]),
+    # A city named on its own (gazetteer, case-sensitive so it doesn't fire on lowercase common words).
+    ("VILLE", _CITY, 0.55, ["ville", "commune", "habite", "réside", "domicil"]),
 ]
 
 class _Checksum(PatternRecognizer):

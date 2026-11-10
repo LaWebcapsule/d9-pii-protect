@@ -1,9 +1,5 @@
-import { Readable } from "node:stream";
-import { randomUUID } from "node:crypto";
 const ENGINE = process.env.PII_PROTECT_ENGINE_URL || "http://host.docker.internal:8077";
 const ENGINE_TOKEN = process.env.PII_PROTECT_ENGINE_TOKEN;
-const SELF = "http://127.0.0.1:" + (process.env.PORT || "8055");
-const BYPASS = randomUUID();
 const FILE_ROUTE = {
   txt: "/anonymize-doc",
   md: "/anonymize-doc",
@@ -20,49 +16,7 @@ const FILE_ROUTE = {
   webp: "/redact-image",
   pdf: "/redact-pdf"
 };
-const FILE_META = ["filename_download", "title", "description"];
-let FIELDS_MAP = null;
-const _pf = process.env.PII_PROTECT_FIELDS;
-if (_pf && _pf !== "*") {
-  try {
-    FIELDS_MAP = JSON.parse(_pf);
-  } catch {
-  }
-}
 const ext = (name) => name.toLowerCase().split(".").pop() || "";
-function textFields(schema, collection) {
-  if (FIELDS_MAP) return FIELDS_MAP[collection] || [];
-  const fields = schema?.collections?.[collection]?.fields || {};
-  return Object.values(fields).filter((f) => f?.type === "text").map((f) => f.field);
-}
-function toList(v) {
-  if (!v) return [];
-  if (Array.isArray(v)) return v;
-  try {
-    const j = JSON.parse(v);
-    if (Array.isArray(j)) return j;
-  } catch {
-  }
-  return String(v).split(",").map((s) => s.trim()).filter(Boolean);
-}
-const roleCache = /* @__PURE__ */ new Map();
-async function roleConfig(database, roleId) {
-  if (!roleId) return { all: false, cols: /* @__PURE__ */ new Set(), at: 0 };
-  const hit = roleCache.get(roleId);
-  if (hit && Date.now() - hit.at < 3e3) return hit;
-  let all = false, cols = /* @__PURE__ */ new Set();
-  try {
-    const row = await database("directus_roles").select("pii_encrypt_all", "pii_encrypt_collections").where({ id: roleId }).first();
-    all = !!row?.pii_encrypt_all;
-    cols = new Set(toList(row?.pii_encrypt_collections));
-  } catch {
-  }
-  const cfg = { all, cols, at: Date.now() };
-  roleCache.set(roleId, cfg);
-  return cfg;
-}
-const anonymizes = (cfg, collection) => cfg.all || cfg.cols.has(collection);
-const anonymizesFiles = (cfg) => cfg.all || cfg.cols.has("directus_files");
 async function post(path, payload) {
   const headers = { "content-type": "application/json" };
   if (ENGINE_TOKEN) headers["x-engine-token"] = ENGINE_TOKEN;
@@ -70,151 +24,127 @@ async function post(path, payload) {
   if (!r.ok) throw new Error("engine HTTP " + r.status);
   return r.json();
 }
-const callText = async (path, text) => (await post(path, { text })).text;
 const callFile = async (path, filename, buf) => Buffer.from((await post(path, { filename, content_b64: buf.toString("base64") })).content_b64, "base64");
 async function bufferStream(stream) {
   const chunks = [];
   for await (const c of stream) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c));
   return Buffer.concat(chunks);
 }
-var index_default = ({ filter, init, action }, { logger, database, services, getSchema }) => {
+const roleCache = /* @__PURE__ */ new Map();
+let fieldsReady = false;
+var index_default = ({ init }, { logger, database, services, getSchema }) => {
+  async function roleMasked(roleId) {
+    if (!fieldsReady || !roleId) return false;
+    const hit = roleCache.get(roleId);
+    if (hit && Date.now() - hit.at < 3e3) return hit.masked;
+    try {
+      const row = await database("directus_roles").select("pii_mask").where({ id: roleId }).first();
+      const masked = !!row?.pii_mask;
+      roleCache.set(roleId, { masked, at: Date.now() });
+      return masked;
+    } catch (e) {
+      if (hit) return hit.masked;
+      logger.warn("[pii-protect] role config read failed, failing closed: " + e.message);
+      return true;
+    }
+  }
+  const maskInPlace = async (root) => {
+    const strings = /* @__PURE__ */ new Set();
+    const walk = (v) => {
+      if (typeof v === "string") {
+        if (v.length >= 2) strings.add(v);
+      } else if (Array.isArray(v)) v.forEach(walk);
+      else if (v && typeof v === "object") for (const k of Object.keys(v)) walk(v[k]);
+    };
+    walk(root);
+    if (!strings.size) return;
+    const list = [...strings];
+    const { results } = await post("/anonymize-batch", { texts: list, strategy: "hash" });
+    const map = new Map(list.map((s, i) => [s, results[i]]));
+    const rep = (v) => {
+      if (typeof v === "string") return map.get(v) ?? v;
+      if (Array.isArray(v)) {
+        for (let i = 0; i < v.length; i++) v[i] = rep(v[i]);
+        return v;
+      }
+      if (v && typeof v === "object") {
+        for (const k of Object.keys(v)) v[k] = rep(v[k]);
+        return v;
+      }
+      return v;
+    };
+    rep(root);
+  };
   init("app.after", async () => {
     try {
       const schema = await getSchema();
       const fieldsSvc = new services.FieldsService({ schema, accountability: { admin: true, role: null } });
       const have = new Set((await fieldsSvc.readAll("directus_roles")).map((f) => f.field));
-      const choices = Object.keys(schema.collections || {}).filter((c) => c === "directus_files" || !c.startsWith("directus_")).sort().map((c) => ({ text: c, value: c }));
-      if (!have.has("pii_encrypt_all")) {
+      if (!have.has("pii_mask")) {
         await fieldsSvc.createField("directus_roles", {
-          field: "pii_encrypt_all",
+          field: "pii_mask",
           type: "boolean",
           meta: {
             interface: "boolean",
             special: ["cast-boolean"],
             width: "full",
-            options: { label: "Encrypt all collections for this role" },
-            note: "Shortcut: anonymize PII everywhere. Turn OFF to pick collections below."
+            options: { label: "Mask PII in this role's API responses" },
+            note: "When ON, every value this role reads via the API (items, GraphQL, files, assets) is scanned and PII is masked (one-way). Complements RBAC \u2014 it does not replace it."
           },
           schema: { default_value: false }
         });
       }
-      const colMeta = {
-        interface: "select-multiple-checkbox",
-        special: ["cast-json"],
-        width: "full",
-        options: { choices },
-        note: "Collections to anonymize for this role.",
-        conditions: [{ name: "Hidden when encrypt-all is on", rule: { pii_encrypt_all: { _eq: true } }, hidden: true }]
-      };
-      if (!have.has("pii_encrypt_collections"))
-        await fieldsSvc.createField("directus_roles", { field: "pii_encrypt_collections", type: "json", meta: colMeta });
-      else
-        await fieldsSvc.updateField("directus_roles", { field: "pii_encrypt_collections", meta: colMeta });
-      logger.info("[pii-protect] role config fields ready");
+      for (const legacy of ["pii_encrypt_all", "pii_encrypt_collections"]) {
+        if (have.has(legacy)) {
+          try {
+            await fieldsSvc.deleteField("directus_roles", legacy);
+            logger.info("[pii-protect] removed legacy field " + legacy);
+          } catch (e) {
+            logger.warn("[pii-protect] could not remove legacy field " + legacy + ": " + e.message);
+          }
+        }
+      }
+      fieldsReady = true;
+      logger.info("[pii-protect] role config ready (pii_mask)");
     } catch (e) {
       logger.warn("[pii-protect] role config setup skipped: " + e.message);
     }
   });
-  const encryptItemFields = async (schema, collection, item) => {
-    if (collection === "directus_files") {
-      for (const f of FILE_META) if (typeof item[f] === "string" && item[f]) {
-        try {
-          item[f] = await callText("/encrypt", item[f]);
-        } catch {
-          item[f] = "[protected]";
-        }
-      }
-    } else {
-      for (const f of textFields(schema, collection)) if (typeof item[f] === "string" && item[f]) {
-        try {
-          item[f] = await callText("/anonymize", item[f]);
-        } catch (e) {
-          logger.warn("[pii-protect] anonymize: " + e.message);
-          item[f] = "[protected \u2014 unavailable]";
-        }
-      }
-    }
-  };
-  const anonItem = async (cfg, schema, collection, item, depth) => {
-    if (!item || typeof item !== "object" || depth > 6) return;
-    if (anonymizes(cfg, collection)) await encryptItemFields(schema, collection, item);
-    for (const rel of schema?.relations || []) {
-      if (rel.collection === collection && rel.related_collection && rel.field in item) {
-        const v = item[rel.field];
-        if (Array.isArray(v)) {
-          for (const x of v) await anonItem(cfg, schema, rel.related_collection, x, depth + 1);
-        } else if (v && typeof v === "object") await anonItem(cfg, schema, rel.related_collection, v, depth + 1);
-      }
-      const of = rel.meta?.one_field;
-      if (rel.related_collection === collection && of && of in item) {
-        const v = item[of];
-        if (Array.isArray(v)) {
-          for (const x of v) await anonItem(cfg, schema, rel.collection, x, depth + 1);
-        } else if (v && typeof v === "object") await anonItem(cfg, schema, rel.collection, v, depth + 1);
-      }
-    }
-  };
-  filter("items.read", async (payload, meta, ctx) => {
-    if (!payload) return payload;
-    const cfg = await roleConfig(ctx?.database, ctx?.accountability?.role);
-    const items = Array.isArray(payload) ? payload : [payload];
-    for (const it of items) await anonItem(cfg, ctx?.schema, meta.collection, it, 0);
-    return payload;
-  });
-  const rehydrate = async (payload, meta, ctx) => {
-    if (!payload) return payload;
-    const cfg = await roleConfig(ctx?.database, ctx?.accountability?.role);
-    if (!anonymizes(cfg, meta.collection)) return payload;
-    for (const f of textFields(ctx?.schema, meta.collection)) {
-      if (typeof payload[f] === "string" && payload[f].includes("[[PII:")) {
-        try {
-          payload[f] = await callText("/rehydrate", payload[f]);
-        } catch (e) {
-          logger.warn("[pii-protect] rehydrate: " + e.message);
-        }
-      }
-    }
-    return payload;
-  };
-  filter("items.create", rehydrate);
-  filter("items.update", rehydrate);
   init("routes.before", ({ app }) => {
-    const guard = (deny, handle) => async (req, res, next) => {
-      if (req.headers["x-pii-bypass"] === BYPASS) return next();
-      let on = false;
-      try {
-        on = anonymizesFiles(await roleConfig(database, req.accountability?.role));
-      } catch {
+    const SCAN = ["/items", "/graphql", "/files"];
+    const shouldScan = (p) => SCAN.some((s) => p === s || p.startsWith(s + "/"));
+    app.use(async (req, res, next) => {
+      const path = (req.originalUrl || "").split("?")[0];
+      const isExport = !!req.query?.export || path.startsWith("/utils/export");
+      if (isExport && await roleMasked(req.accountability?.role)) {
+        return res.status(403).json({ errors: [{ message: "bulk export is disabled for this role (PII protection)" }] });
       }
-      if (!on) return next();
-      try {
-        const orig = await fetch(SELF + req.originalUrl, {
-          headers: { authorization: req.headers.authorization || "", cookie: req.headers.cookie || "", "x-pii-bypass": BYPASS }
+      next();
+    });
+    app.use((req, res, next) => {
+      if (!shouldScan((req.originalUrl || "").split("?")[0])) return next();
+      const origJson = res.json.bind(res);
+      let handled = false;
+      res.json = (body) => {
+        if (handled) return origJson(body);
+        handled = true;
+        (async () => {
+          if (body && typeof body === "object" && await roleMasked(req.accountability?.role)) {
+            await maskInPlace(body);
+            res.setHeader("cache-control", "no-store");
+          }
+          origJson(body);
+        })().catch((e) => {
+          logger.warn("[pii-protect] masking failed (fail-closed): " + e.message);
+          if (!res.headersSent) res.status(503);
+          origJson({ errors: [{ message: "PII masking unavailable" }] });
         });
-        if (!orig.ok) return deny(res, orig.status > 200 ? orig.status : 502);
-        await handle(orig, req, res);
-      } catch (e) {
-        logger.warn("[pii-protect] " + req.path + " (fail-closed): " + e.message);
-        deny(res, 503);
-      }
-    };
-    const denyJson = (res, code) => res.status(code).json({ errors: [{ message: "protected" }] });
-    app.get(["/files", "/files/:pk"], guard(denyJson, async (orig, _req, res) => {
-      const json = await orig.json();
-      const rows = Array.isArray(json?.data) ? json.data : [json?.data];
-      for (const row of rows) for (const f of row ? FILE_META : []) {
-        if (typeof row[f] === "string" && row[f]) row[f] = await callText("/encrypt", row[f]);
-      }
-      res.setHeader("cache-control", "no-store");
-      res.json(json);
-    }));
-    app.get("/assets/:pk", async (req, res, next) => {
-      let on = false;
-      try {
-        on = anonymizesFiles(await roleConfig(database, req.accountability?.role));
-      } catch {
-      }
-      if (!on) return next();
+        return res;
+      };
+      next();
+    });
+    app.get(["/assets/:pk", "/assets/:pk/:filename"], async (req, res, next) => {
+      if (!await roleMasked(req.accountability?.role)) return next();
       try {
         const assets = new services.AssetsService({ schema: await getSchema(), accountability: req.accountability });
         const { stream, file } = await assets.getAsset(req.params.pk, {});
@@ -224,7 +154,7 @@ var index_default = ({ filter, init, action }, { logger, database, services, get
         const out = await callFile(endpoint, name, await bufferStream(stream));
         res.setHeader("content-type", file?.type || "application/octet-stream");
         res.setHeader("cache-control", "no-store");
-        res.setHeader("content-disposition", "attachment; filename*=UTF-8''" + encodeURIComponent(await callText("/encrypt", name)));
+        res.setHeader("content-disposition", 'attachment; filename="protected' + (ext(name) ? "." + ext(name) : "") + '"');
         res.send(out);
       } catch (e) {
         logger.warn("[pii-protect] /assets (fail-closed): " + e.message);
@@ -232,32 +162,7 @@ var index_default = ({ filter, init, action }, { logger, database, services, get
       }
     });
   });
-  action("files.upload", async (meta, ctx) => {
-    try {
-      if (!anonymizesFiles(await roleConfig(database, ctx?.accountability?.role))) return;
-      const key = meta?.key || meta?.payload?.id || meta;
-      if (typeof key !== "string") return;
-      const schema = await getSchema();
-      const sys = { admin: true, role: null };
-      const files = new services.FilesService({ schema, accountability: sys });
-      const file = await files.readOne(key);
-      const name = file?.filename_download || file?.filename_disk || "";
-      if (FILE_ROUTE[ext(name)] !== "/anonymize-doc") return;
-      const asset = await new services.AssetsService({ schema, accountability: sys }).getAsset(key, {});
-      const buf = await bufferStream(asset.stream || asset);
-      const clear = await callFile("/rehydrate-doc", name, buf);
-      if (clear.equals(buf)) return;
-      await files.uploadOne(
-        Readable.from(clear),
-        { type: file.type, filename_download: file.filename_download, storage: file.storage, title: file.title },
-        key
-      );
-      logger.info("[pii-protect] document rehydrated on re-upload (" + name + ")");
-    } catch (e) {
-      logger.warn("[pii-protect] files.upload: " + e.message);
-    }
-  });
-  logger.info("[pii-protect] loaded (engine " + ENGINE + ")");
+  logger.info("[pii-protect] loaded (engine " + ENGINE + ", hoop-style output masking)");
 };
 export {
   index_default as default

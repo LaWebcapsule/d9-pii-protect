@@ -1,20 +1,18 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Governed PII anonymization engine (sidecar) — embedded French Presidio.
+Governed PII masking engine (sidecar) — embedded French Presidio. One-way (no decryption).
 
   detection = Presidio (analyzer.py): FR NER Anonym-IA + regex/checksum recognizers + context scoring
-  reversible encryption = AES-256-GCM in-place, markers [[PII:TYPE:b64]] (crypto.py)
+  masking   = each detected value -> consistent keyed token [TYPE:hash] (crypto.py)
 
 Endpoints (JSON):
-  POST /anonymize      {text}                  -> {text, count, entities}   (encrypt detected PII)
-  POST /encrypt        {text}                  -> {text, count}             (encrypt the WHOLE value, 1 marker)
-  POST /rehydrate      {text}                  -> {text, count}
-  POST /anonymize-doc  {filename, content_b64} -> {filename, content_b64}   (.txt/.md/.csv/.json/.docx)
-  POST /rehydrate-doc  {filename, content_b64} -> {filename, content_b64}
-  POST /redact-image   {filename, content_b64} -> {filename, content_b64}   (OCR redaction, destructive)
-  POST /redact-pdf     {filename, content_b64} -> {filename, content_b64}   (PDF -> redacted pages, destructive)
-  POST /detect         {text}                  -> {spans:[{start,end,type,text}]}
+  POST /anonymize       {text}                  -> {text, count, entities}  (mask detected PII)
+  POST /anonymize-batch {texts:[…]}             -> {results:[…]}            (mask many strings in one call)
+  POST /detect          {text}                  -> {spans:[{start,end,type,text}]}
+  POST /anonymize-doc   {filename, content_b64} -> {filename, content_b64}  (.txt/.md/.csv/.json/.docx)
+  POST /redact-image    {filename, content_b64} -> {filename, content_b64}  (OCR redaction, destructive)
+  POST /redact-pdf      {filename, content_b64} -> {filename, content_b64}  (PDF -> redacted pages, destructive)
   GET  /health
 
 Config (env): PII_PROTECT_KEY, PII_NER_MODEL, PII_NER_THRESHOLD, PORT.
@@ -53,7 +51,7 @@ def anonymize(text):
     spans = [sp for sp in analyzer.detect(text) if _should_encrypt(sp[2])]
     out, entities = text, []
     for s, e, t in sorted(spans, key=lambda x: x[0], reverse=True):
-        out = out[:s] + crypto.marker(t, text[s:e]) + out[e:]
+        out = out[:s] + crypto.hashtok(t, text[s:e]) + out[e:]
         entities.append(t)
     return out, list(reversed(entities))
 
@@ -77,9 +75,9 @@ def _docx_transform(data, fn):
                 else: p.add_run(new)
     out = io.BytesIO(); d.save(out); return out.getvalue()
 
-def process_doc(filename, data, mode):
+def process_doc(filename, data):
     ext = (filename or "").lower().rsplit(".", 1)[-1]
-    fn = (lambda t: anonymize(t)[0]) if mode == "anonymize" else (lambda t: crypto.rehydrate(t)[0])
+    fn = lambda t: anonymize(t)[0]
     if ext == "docx":
         return _docx_transform(data, fn)
     return fn(data.decode("utf-8", "replace")).encode("utf-8")
@@ -95,28 +93,22 @@ def _anonymize(b):
     out, ents = anonymize(b.get("text", ""))
     return {"text": out, "count": len(ents), "entities": ents}
 
-def _encrypt(b):
-    # Encrypt the WHOLE value into one marker (e.g. a filename: protect everything, not per-PII).
-    t = b.get("text", "")
-    return {"text": crypto.marker("TEXT", t) if t else t, "count": 1 if t else 0}
-
-def _rehydrate(b):
-    out, c = crypto.rehydrate(b.get("text", ""))
-    return {"text": out, "count": c}
+def _anonymize_batch(b):
+    # Mask many strings in ONE round trip (the response interceptor sends a whole payload's unique strings).
+    return {"results": [anonymize(t)[0] if isinstance(t, str) else t for t in b.get("texts", [])]}
 
 def _detect(b):
     t = b.get("text", "")
     return {"spans": [{"start": s, "end": e, "type": ty, "text": t[s:e]} for s, e, ty in analyzer.detect(t)]}
 
+# NOTE: no /rehydrate, /encrypt, /rehydrate-doc — masking is one-way (hoop-style). No decryption oracle.
 POST_ROUTES = {
-    "/anonymize":     _anonymize,
-    "/encrypt":       _encrypt,
-    "/rehydrate":     _rehydrate,
-    "/detect":        _detect,
-    "/anonymize-doc": lambda b: _file_op(b, lambda d: process_doc(b.get("filename", ""), d, "anonymize")),
-    "/rehydrate-doc": lambda b: _file_op(b, lambda d: process_doc(b.get("filename", ""), d, "rehydrate")),
-    "/redact-image":  lambda b: _file_op(b, image_redact.redact_image),
-    "/redact-pdf":    lambda b: _file_op(b, image_redact.redact_pdf),
+    "/anonymize":       _anonymize,
+    "/anonymize-batch": _anonymize_batch,
+    "/detect":          _detect,
+    "/anonymize-doc":   lambda b: _file_op(b, lambda d: process_doc(b.get("filename", ""), d)),
+    "/redact-image":    lambda b: _file_op(b, image_redact.redact_image),
+    "/redact-pdf":      lambda b: _file_op(b, image_redact.redact_pdf),
 }
 
 # ---------------------------------------------------------------- HTTP

@@ -34,7 +34,9 @@ def warmup():
 def detect(text):
     """Return [(start, end, ENTITY)] — deduplicated by score (highest wins on overlap)."""
     results = engine().analyze(text=text, language="fr")
-    results = sorted(results, key=lambda r: (-r.score, -(r.end - r.start)))
+    # Longest span first (score as tiebreak): a full match (whole phone/address) must beat a shorter
+    # higher-confidence NER fragment — otherwise part of the PII (e.g. the tail of a phone) leaks.
+    results = sorted(results, key=lambda r: (-(r.end - r.start), -r.score))
     kept = []
     for r in results:
         if any(r.start < k.end and k.start < r.end for k in kept):  # overlaps an already-kept span
