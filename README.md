@@ -1,16 +1,16 @@
 # d9 PII Protect
 
-Governed PII masking for AI agents in [d9](https://github.com/LaWebcapsule/d9).
+Hide personal data from the roles you choose, in [d9](https://github.com/LaWebcapsule/d9).
 
-For the roles you choose, PII in **every API response** (items, GraphQL, files, assets) is **masked on the
-way out** — each detected value is replaced by a consistent, one-way token like `[NOM_PERSONNE:a3f9c2…]`
-(documents/images are redacted). Authorized roles (admins, unconfigured roles) still read the original; the
-database stays in clear. Detection is French-first (Presidio + a FR NER model) and runs in a self-contained
-engine next to d9 — PII never leaves your environment.
+Turn on one switch for a role, and every piece of personal data that role reads — names, emails, phone
+numbers, social-security / company numbers, addresses… — is automatically replaced by a token like
+`[NOM_PERSONNE:a3f9c2]`. Every other role keeps seeing the real values, and the database itself is never
+changed. It works across the whole d9 API (REST, GraphQL, file downloads).
 
-This **complements RBAC — it does not replace it**. The goal is to keep PII out of an AI agent's prompts and
-traces (protect the agent from itself), not to defend against a deliberately hostile user. See
-[Known limitations](#known-limitations).
+The typical use: let an **AI agent** work with your data without real PII ever landing in its prompts or logs.
+
+Detection is French-first and runs in a small engine next to d9, so your data never leaves your environment.
+It **complements** d9's permissions — it doesn't replace them. See [Known limitations](#known-limitations).
 
 ## 🤖 Set it up with AI
 
@@ -45,16 +45,11 @@ docker compose up -d --build    # d9 on http://localhost:8055 + the PII engine
 
 ## Use it
 
-Open **Settings → Roles & Permissions → a role**. The extension adds one control there automatically
-(no setup script):
+Open **Settings → Roles & Permissions → a role** and turn on **Mask PII in this role's API responses**.
 
-- **Mask PII in this role's API responses** — turn it on.
-
-Every value that role reads via the API is then scanned and its PII replaced by a one-way token
-(`[TYPE:hash]`, e.g. `[NOM_PERSONNE:a3f9c2…]`); anyone whose role isn't configured sees the clear value. The
-token is a consistent keyed hash, so the same value always yields the same token (joins/dedup still work) but
-there is no way back to the clear. It applies to **any role, humans included**, so you can also hide data from
-some human maintainers. Changing this requires role-edit rights, so a regular user can't alter it.
+That's it. Everyone in that role now reads every text field (short or long) with its personal data masked;
+other roles are unaffected. Numbers and other non-text fields are left to d9's own permissions. Turning the
+switch requires role-edit rights, so a regular user can't change what's masked.
 
 ## Configuration (environment variables)
 
