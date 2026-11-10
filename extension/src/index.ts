@@ -101,17 +101,15 @@ export default ({ init }: any, { logger, database, services, getSchema }: any) =
       const schema = await getSchema();
       const fieldsSvc = new services.FieldsService({ schema, accountability: { admin: true, role: null } });
       const have = new Set((await fieldsSvc.readAll('directus_roles')).map((f: any) => f.field));
-      if (!have.has('pii_mask')) {
-        await fieldsSvc.createField('directus_roles', {
-          field: 'pii_mask', type: 'boolean',
-          meta: {
-            interface: 'boolean', special: ['cast-boolean'], width: 'full',
-            options: { label: "Mask PII in this role's API responses" },
-            note: 'When ON, every value this role reads via the API (items, GraphQL, files, assets) is scanned and PII is masked (one-way). Complements RBAC — it does not replace it.',
-          },
-          schema: { default_value: false },
-        });
-      }
+      const piiMeta = {
+        interface: 'boolean', special: ['cast-boolean'], width: 'full',
+        options: { label: "Mask PII in this role's API responses" },
+        note: "When ON, personal data in everything this role reads through the API is replaced by a masked token. Complements RBAC — it doesn't replace it.",
+      };
+      if (!have.has('pii_mask'))
+        await fieldsSvc.createField('directus_roles', { field: 'pii_mask', type: 'boolean', meta: piiMeta, schema: { default_value: false } });
+      else
+        await fieldsSvc.updateField('directus_roles', { field: 'pii_mask', meta: piiMeta }); // refresh label/note on upgrade
       // Self-cleanup: drop the legacy fields from the previous (reversible, per-collection) model.
       for (const legacy of ['pii_encrypt_all', 'pii_encrypt_collections']) {
         if (have.has(legacy)) {

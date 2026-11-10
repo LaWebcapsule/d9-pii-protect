@@ -80,20 +80,17 @@ var index_default = ({ init }, { logger, database, services, getSchema }) => {
       const schema = await getSchema();
       const fieldsSvc = new services.FieldsService({ schema, accountability: { admin: true, role: null } });
       const have = new Set((await fieldsSvc.readAll("directus_roles")).map((f) => f.field));
-      if (!have.has("pii_mask")) {
-        await fieldsSvc.createField("directus_roles", {
-          field: "pii_mask",
-          type: "boolean",
-          meta: {
-            interface: "boolean",
-            special: ["cast-boolean"],
-            width: "full",
-            options: { label: "Mask PII in this role's API responses" },
-            note: "When ON, every value this role reads via the API (items, GraphQL, files, assets) is scanned and PII is masked (one-way). Complements RBAC \u2014 it does not replace it."
-          },
-          schema: { default_value: false }
-        });
-      }
+      const piiMeta = {
+        interface: "boolean",
+        special: ["cast-boolean"],
+        width: "full",
+        options: { label: "Mask PII in this role's API responses" },
+        note: "When ON, personal data in everything this role reads through the API is replaced by a masked token. Complements RBAC \u2014 it doesn't replace it."
+      };
+      if (!have.has("pii_mask"))
+        await fieldsSvc.createField("directus_roles", { field: "pii_mask", type: "boolean", meta: piiMeta, schema: { default_value: false } });
+      else
+        await fieldsSvc.updateField("directus_roles", { field: "pii_mask", meta: piiMeta });
       for (const legacy of ["pii_encrypt_all", "pii_encrypt_collections"]) {
         if (have.has(legacy)) {
           try {
